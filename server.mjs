@@ -12,12 +12,63 @@ function json(response, status, body) {
 async function handleTriage(request, response) {
   const chunks = [];
   for await (const chunk of request) chunks.push(chunk);
-  const { text } = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  const result = JSON.parse(await classify(text));
-  return json(response, 200, { status: "ready", ...result });
+  let input;
+  try {
+    input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    return json(response, 400, { status: "invalid_input" });
+  }
+  if (
+    input === null ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    typeof input.text !== "string" ||
+    input.text.trim() === ""
+  ) {
+    return json(response, 400, { status: "invalid_input" });
+  }
+
+  const controller = new AbortController();
+  let timer;
+  try {
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error("Model deadline exceeded"));
+        controller.abort();
+      }, 300);
+    });
+    const raw = await Promise.race([
+      classify(input.text, { signal: controller.signal }),
+      deadline,
+    ]);
+    const result = JSON.parse(raw);
+    if (
+      result === null ||
+      typeof result !== "object" ||
+      Array.isArray(result) ||
+      !["delivery", "pricing", "other"].includes(result.topic) ||
+      typeof result.draft !== "string" ||
+      result.draft.trim() === ""
+    ) {
+      throw new Error("Invalid model response");
+    }
+    return json(response, 200, {
+      status: "ready",
+      topic: result.topic,
+      draft: result.draft,
+    });
+  } catch {
+    return json(response, 200, {
+      status: "manual_review",
+      topic: null,
+      draft: null,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-createServer(async (request, response) => {
+const server = createServer(async (request, response) => {
   if (request.method === "GET" && request.url === "/") {
     response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     response.end(html);
@@ -31,4 +82,8 @@ createServer(async (request, response) => {
   } catch {
     json(response, 500, { status: "server_error" });
   }
-}).listen(Number(process.env.PORT || 3000), "127.0.0.1");
+});
+
+server.listen(Number(process.env.PORT || 3000), "127.0.0.1", () => {
+  console.log(`Listening on http://127.0.0.1:${server.address().port}`);
+});
